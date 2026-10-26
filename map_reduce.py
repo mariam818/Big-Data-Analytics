@@ -5,12 +5,13 @@ import threading
 from collections import defaultdict
 
 
+NUM_REDUCERS = 2
+
 def read_file(file_path):
     with open(file_path, "r", encoding="utf-8") as file:
         return file.read()
 
 
-# Split text into words and emit (word, 1)
 def mapper(file_path):
     text = read_file(file_path)
     words = re.findall(r"\b\w+\b", text.lower())
@@ -24,19 +25,17 @@ def mapper(file_path):
 
 
 def run_mappers(files):
-    results = []
-    lock = threading.Lock()
-
-    def worker(file_path):
-        local_result = mapper(file_path)
-
-        with lock:
-            results.extend(local_result)
-
+    results = [None] * len(files)
     threads = []
 
-    for file_path in files:
-        thread = threading.Thread(target=worker, args=(file_path,))
+    def worker(index, file_path):
+        results[index] = mapper(file_path)
+
+    for index, file_path in enumerate(files):
+        thread = threading.Thread(
+            target=worker,
+            args=(index, file_path)
+        )
         threads.append(thread)
         thread.start()
 
@@ -46,55 +45,98 @@ def run_mappers(files):
     return results
 
 
-def combine_and_partition(pairs, num_reducers=2):
-    combined = defaultdict(int)
+def combine(mapper_results):
+    combined_results = []
 
-    for word, count in pairs:
-        combined[word] += count
+    for pairs in mapper_results:
+        local_counts = defaultdict(int)
 
-    partitions = [[] for _ in range(num_reducers)]
+        for word, count in pairs:
+            local_counts[word] += count
 
-    for word, count in combined.items():
-        reducer_id = hash(word) % num_reducers
-        partitions[reducer_id].append((word, count))
+        combined_results.append(list(local_counts.items()))
+
+    return combined_results
+
+
+def partition(word):
+    return sum(ord(char) for char in word) % NUM_REDUCERS
+
+
+def partition_data(combined_results):
+    partitions = [[] for _ in range(NUM_REDUCERS)]
+
+    for mapper_pairs in combined_results:
+        for word, count in mapper_pairs:
+            reducer_id = partition(word)
+            partitions[reducer_id].append((word, count))
 
     return partitions
 
 
-def reducer(partition, output_file):
-    partition.sort(key=lambda pair: pair[0])
-
-    totals = defaultdict(int)
+def shuffle_and_sort(partition):
+    grouped_words = defaultdict(list)
 
     for word, count in partition:
-        totals[word] += count
+        grouped_words[word].append(count)
 
+    sorted_words = {}
+
+    for word in sorted(grouped_words):
+        sorted_words[word] = grouped_words[word]
+
+    return sorted_words
+
+
+def reducer(grouped_words, output_file):
     with open(output_file, "w", encoding="utf-8") as file:
-        for word in sorted(totals):
-            file.write(f"{word}\t{totals[word]}\n")
+        for word, counts in grouped_words.items():
+            total = sum(counts)
+            file.write(f"{word}\t{total}\n")
 
 
 def main(input_folder, output_folder):
     os.makedirs(output_folder, exist_ok=True)
 
-    files = [
+    files = sorted([
         os.path.join(input_folder, name)
         for name in os.listdir(input_folder)
-        if name.endswith(".txt") and name != "expected_word_count.txt"
-    ]
+        if name.endswith(".txt")
+        and name != "expected_word_count.txt"
+    ])
 
-    mapped_pairs = run_mappers(files)
+    if not files:
+        raise FileNotFoundError(
+            f"No input text files found in {input_folder}"
+        )
 
-    partitions = combine_and_partition(mapped_pairs)
+    print("Input splits:", len(files))
+    mapper_results = run_mappers(files)
+    print("Phase 1: Map completed")
+
+    combined_results = combine(mapper_results)
+    print("Phase 2: Combine completed")
+
+    partitions = partition_data(combined_results)
+    print("Phase 3: Partition completed")
+
+    reducer_inputs = []
+
+    for part in partitions:
+        reducer_inputs.append(shuffle_and_sort(part))
+
+    print("Phase 4: Shuffle and Sort completed")
 
     threads = []
 
-    for i, partition in enumerate(partitions):
-        output_file = os.path.join(output_folder, f"part-{i}.txt")
+    for i, grouped_words in enumerate(reducer_inputs):
+        output_file = os.path.join(
+            output_folder, f"part-{i}.txt"
+        )
 
         thread = threading.Thread(
             target=reducer,
-            args=(partition, output_file)
+            args=(grouped_words, output_file)
         )
 
         threads.append(thread)
@@ -103,9 +145,18 @@ def main(input_folder, output_folder):
     for thread in threads:
         thread.join()
 
+    print("Phase 5: Reduce completed")
     print("MapReduce completed successfully!")
+    print("Output files: part-0.txt, part-1.txt")
 
 
 if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    main(os.path.join(script_dir, "datasets", "text-files"), "output")
+
+    input_folder = os.path.join(
+        script_dir, "datasets", "text-files"
+    )
+
+    output_folder = os.path.join(script_dir, "output")
+
+    main(input_folder, output_folder)
